@@ -41,7 +41,7 @@
   const P = () => state.profiles.find((p) => p.id === state.activeId);
   function D(pid = state.activeId) {
     const d = state.data[pid] || (state.data[pid] = {});
-    d.days ||= {}; d.who5 ||= []; d.fit ||= {}; d.workouts ||= []; d.lifts ||= [];
+    d.days ||= {}; d.who5 ||= []; d.fit ||= {}; d.workouts ||= []; d.lifts ||= []; d.recaps ||= {};
     return d;
   }
   const emptyDay = () => ({ done: {}, minutes: {}, plate: {}, kcal: {} });
@@ -224,6 +224,178 @@
       <p class="small">HappyPlace is a habit tool, not a diagnosis or treatment.</p></div>`;
   }
 
+  // ---------- monthly recaps & data compaction ----------
+  const KEEP_DAYS = 90;
+  const monthKey = (k) => k.slice(0, 7);
+  const monthLabel = (mk) => { const [y, m] = mk.split("-").map(Number); return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" }); };
+  const FACES = ["😢", "😕", "😐", "🙂", "😄"];
+  const faceFor = (v) => FACES[Math.max(0, Math.min(4, Math.round(v / 2.5)))];
+
+  function buildRecap(p, mk) {
+    const data = D();
+    const keys = Object.keys(data.days).filter((k) => monthKey(k) === mk).sort();
+    const rated = keys.filter((k) => data.days[k].mood != null);
+    const moods = rated.map((k) => data.days[k].mood);
+    const habits = {}, minutes = {};
+    keys.forEach((k) => {
+      const d = data.days[k];
+      Object.keys(d.done || {}).forEach((id) => { if (d.done[id]) habits[id] = (habits[id] || 0) + 1; });
+      Object.entries(d.minutes || {}).forEach(([id, n]) => { minutes[id] = (minutes[id] || 0) + n; if (n > 0) habits[id] = (habits[id] || 0) + 1; });
+    });
+    const did = (k, id) => !!((data.days[k].done || {})[id] || ((data.days[k].minutes || {})[id] || 0) > 0);
+
+    // Weekly targets hit, for weeks that start in this month.
+    let hit = 0, possible = 0;
+    const items = activeItems(p);
+    keys.map(weekStartK).filter((ws, i, arr) => arr.indexOf(ws) === i && monthKey(ws) === mk && daysBetween(ws, todayK()) >= 7)
+      .forEach((ws) => items.forEach((a) => { possible++; if (weekAmount(a, ws) >= targetFor(p, a)) hit++; }));
+
+    // Movement.
+    const wo = data.workouts.filter((w) => monthKey(w.date) === mk);
+    const strengthDays = new Set(wo.filter((w) => w.type === "strength").map((w) => w.date));
+    const monthLifts = data.lifts.filter((l) => monthKey(l.date) === mk);
+    monthLifts.forEach((l) => strengthDays.add(l.date));
+    const move = {
+      minutes: wo.reduce((s, w) => s + w.min, 0),
+      active: wo.reduce((s, w) => s + (w.effort === "vigorous" ? 2 * w.min : w.effort === "moderate" ? w.min : 0), 0),
+      workouts: wo.length,
+      miles: round(wo.reduce((s, w) => s + (w.dist || 0), 0), 1),
+      strengthDays: strengthDays.size
+    };
+
+    // Lifting personal bests vs everything before this month (including older recaps).
+    const priorBest = {};
+    data.lifts.filter((l) => monthKey(l.date) < mk).forEach((l) => { priorBest[l.ex] = Math.max(priorBest[l.ex] || 0, l.lb || 0); });
+    Object.values(data.recaps).filter((r) => r.month < mk).forEach((r) => (r.bests || []).forEach((b) => { priorBest[b.ex] = Math.max(priorBest[b.ex] || 0, b.lb); }));
+    const bestThisMonth = {};
+    monthLifts.forEach((l) => { bestThisMonth[l.ex] = Math.max(bestThisMonth[l.ex] || 0, l.lb || 0); });
+    const bests = Object.entries(bestThisMonth).filter(([, lb]) => lb > 0).map(([ex, lb]) => ({ ex, lb, prev: priorBest[ex] || 0 }));
+
+    // WHO-5 change within the month.
+    const w5 = data.who5.filter((x) => monthKey(x.date) === mk);
+
+    // Balanced meals.
+    let balanced = 0;
+    keys.forEach((k) => Object.values(data.days[k].plate || {}).forEach((m) => { if (m.veg && m.protein && m.grain) balanced++; }));
+
+    // "Your best days usually included…"
+    let bestDayHabit = null;
+    if (rated.length >= 8) {
+      const top = [...rated].sort((a, b) => data.days[b].mood - data.days[a].mood).slice(0, Math.max(3, Math.round(rated.length / 4)));
+      let bestLift = 0.2;
+      Object.keys(habits).forEach((id) => {
+        const rTop = top.filter((k) => did(k, id)).length / top.length;
+        const rAll = rated.filter((k) => did(k, id)).length / rated.length;
+        if (rTop >= 0.6 && rTop - rAll >= bestLift) { bestLift = rTop - rAll; bestDayHabit = id; }
+      });
+    }
+
+    return {
+      month: mk, created: todayK(), daysLogged: keys.length,
+      moodAvg: moods.length ? round(mean(moods), 1) : null, moodDays: moods.length,
+      habits, minutes, targets: { hit, possible }, move, bests,
+      who5: w5.length ? { first: w5[0].raw * 4, last: w5[w5.length - 1].raw * 4, n: w5.length } : null,
+      balanced, bestDayHabit
+    };
+  }
+
+  // Create recaps for finished months, then compact details older than KEEP_DAYS.
+  function maintainProfile(p) {
+    const data = D(p.id);
+    const cur = monthKey(todayK());
+    const months = new Set([
+      ...Object.keys(data.days).map(monthKey),
+      ...data.workouts.map((w) => monthKey(w.date)),
+      ...data.lifts.map((l) => monthKey(l.date))
+    ]);
+    [...months].filter((mk) => mk < cur && !data.recaps[mk]).sort().forEach((mk) => { data.recaps[mk] = buildRecap(p, mk); });
+
+    const cutoff = addDays(todayK(), -KEEP_DAYS);
+    const covered = (k) => k < cutoff && data.recaps[monthKey(k)];
+    Object.keys(data.days).forEach((k) => { if (covered(k)) delete data.days[k]; });
+    data.workouts = data.workouts.filter((w) => !covered(w.date));
+    const latestPerEx = {};
+    data.lifts.forEach((l) => { if (!latestPerEx[l.ex] || l.date >= latestPerEx[l.ex].date) latestPerEx[l.ex] = l; });
+    data.lifts = data.lifts.filter((l) => !covered(l.date) || latestPerEx[l.ex] === l);
+  }
+  function maintainAll() {
+    const keep = state.activeId;
+    state.profiles.forEach((p) => { state.activeId = p.id; maintainProfile(p); });
+    state.activeId = keep;
+    save();
+  }
+
+  function recapCard(p, r, prev, live) {
+    const kid = p.band === "child";
+    const moodTxt = r.moodAvg == null ? "No mood ratings"
+      : kid ? `Usual feeling ${faceFor(r.moodAvg)}` : `Average mood ${r.moodAvg}/10`;
+    const moodDelta = r.moodAvg != null && prev && prev.moodAvg != null ? round(r.moodAvg - prev.moodAvg, 1) : null;
+    const top = Object.entries(r.habits).map(([id, n]) => ({ a: actById(id), n })).filter((x) => x.a).sort((x, y) => y.n - x.n).slice(0, 3);
+    const lines = [];
+    lines.push(`<b>${moodTxt}</b>${r.moodDays ? ` <span class="small">(${r.moodDays} days rated)</span>` : ""}${moodDelta != null && !kid ? ` · <span class="small">${moodDelta >= 0 ? "▲" : "▼"} ${Math.abs(moodDelta)} vs last month</span>` : ""}`);
+    lines.push(`Checked in on <b>${r.daysLogged}</b> day${r.daysLogged === 1 ? "" : "s"}`);
+    if (top.length) lines.push(`Top habits: ${top.map((x) => `${x.a.emoji} ${esc(labelFor(p, x.a))} <span class="small">(${x.n} days)</span>`).join(", ")}`);
+    if (r.targets && r.targets.possible) lines.push(`Weekly targets hit: <b>${r.targets.hit} of ${r.targets.possible}</b> (${Math.round((r.targets.hit / r.targets.possible) * 100)}%)`);
+    if (r.move && r.move.minutes) lines.push(`Movement: <b>${p.band === "adult" ? `${r.move.active} active min` : `${r.move.minutes} min`}</b> · ${r.move.workouts} activities${r.move.miles ? ` · ${r.move.miles} mi` : ""}${r.move.strengthDays ? ` · ${r.move.strengthDays} strength days` : ""}`);
+    const prs = (r.bests || []).filter((b) => b.lb > b.prev);
+    if (prs.length) lines.push(`New personal bests: ${prs.map((b) => `${esc(b.ex)} ${b.lb} lb${b.prev ? ` <span class="small">(was ${b.prev})</span>` : ""}`).join(", ")}`);
+    if (r.who5) lines.push(`Well-being check-in: <b>${r.who5.n > 1 ? `${r.who5.first}% → ${r.who5.last}%` : `${r.who5.last}%`}</b>`);
+    if (r.balanced) lines.push(`Balanced plates: <b>${r.balanced}</b>`);
+    if (r.bestDayHabit && actById(r.bestDayHabit)) lines.push(`✨ Your best days usually included <b>${esc(labelFor(p, actById(r.bestDayHabit)))}</b> <span class="small">(a pattern, not proof)</span>`);
+    return `<div class="card ${live ? "" : "soft"}"><h3>${live ? "📅" : "🏅"} ${monthLabel(r.month)}${live ? " <span class=\"small\">so far</span>" : ""}</h3>
+      ${lines.map((l) => `<p>${l}</p>`).join("")}</div>`;
+  }
+
+  function thirtyDayStrip(p) {
+    const items = activeItems(p);
+    const t = todayK();
+    const cells = [];
+    for (let i = 29; i >= 0; i--) {
+      const k = addDays(t, -i);
+      const d = D().days[k];
+      const done = d ? items.filter((a) => (d.done || {})[a.id] || ((d.minutes || {})[a.id] || 0) > 0).length : 0;
+      const frac = items.length ? done / items.length : 0;
+      const m = d && d.mood != null ? d.mood : null;
+      const color = m == null ? "var(--line)" : `color-mix(in srgb, var(--accent) ${15 + m * 8.5}%, var(--card))`;
+      cells.push(`<div title="${shortDate(k)}: ${done} habit${done === 1 ? "" : "s"}${m != null ? `, mood ${p.band === "child" ? faceFor(m) : m}` : ""}" style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:64px">
+        <div style="height:${6 + frac * 58}px;background:${color};border-radius:4px;${i === 0 ? "outline:2px solid var(--text);outline-offset:1px" : ""}"></div></div>`);
+    }
+    const avg = (from, to) => {
+      const ks = []; for (let i = from; i < to; i++) ks.push(addDays(t, -i));
+      const ms = ks.map((k) => (D().days[k] || {}).mood).filter((x) => x != null);
+      const hs = ks.map((k) => { const d = D().days[k]; return d ? items.filter((a) => (d.done || {})[a.id] || ((d.minutes || {})[a.id] || 0) > 0).length : 0; });
+      return { mood: ms.length ? mean(ms) : null, habits: mean(hs) };
+    };
+    const a = avg(0, 7), b = avg(7, 14);
+    const cmp = (x, y, unit) => (x == null || y == null ? "" : ` <span class="small">${x >= y ? "▲" : "▼"} ${round(Math.abs(x - y), 1)}${unit} vs the week before</span>`);
+    return `<div class="card"><h3>Last 30 days</h3>
+      <div style="display:flex;gap:2px;align-items:flex-end">${cells.join("")}</div>
+      <div class="mood-scale"><span>${shortDate(addDays(t, -29))}</span><span>Today</span></div>
+      <p class="small">Taller = more habits done. Darker = better mood. Gray = no rating.</p>
+      <p>This week: <b>${round(a.habits, 1)} habits/day</b>${cmp(a.habits, b.habits, "")}${a.mood != null ? ` · mood <b>${p.band === "child" ? faceFor(a.mood) : round(a.mood, 1)}</b>${p.band === "child" ? "" : cmp(a.mood, b.mood, "")}` : ""}</p></div>`;
+  }
+
+  // ---------- privacy lock ----------
+  const unlocked = new Set();
+  async function hashPin(pin, salt) {
+    try {
+      const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${salt}:${pin}`));
+      return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    } catch (e) {
+      let h = 5381; for (const c of `${salt}:${pin}`) h = ((h * 33) ^ c.charCodeAt(0)) >>> 0;
+      return "f" + h.toString(16);
+    }
+  }
+  const isLocked = (p) => p && p.pinHash && !unlocked.has(p.id);
+  function renderLocked(p) {
+    return `<div style="text-align:center;padding-top:30px"><div class="avatar" style="width:72px;height:72px;font-size:38px">${esc(p.emoji)}</div>
+      <h1 style="margin-top:12px">${esc(p.name)}</h1><p class="sub">This profile is private. Enter ${esc(p.name)}'s PIN.</p></div>
+      <div class="card"><label class="field">PIN<input id="pinIn" type="password" inputmode="numeric" autocomplete="off" maxlength="8"></label>
+      <div class="row"><button class="btn" data-action="unlock">Unlock</button><button class="btn ghost" data-action="people">Switch person</button></div></div>
+      <details class="small"><summary>Forgot the PIN?</summary><p>For privacy, a PIN can't be recovered. The only way back in is to delete ${esc(p.name)}'s data and start fresh.</p>
+      <button class="btn small danger" data-action="forgot-pin">${confirmKey === "forgot" ? `Tap again to delete ${esc(p.name)}'s data` : "Delete and start over"}</button></details>`;
+  }
+
   // ---------- views ----------
   let viewDate = todayK();
   let pendingFit = null, fitDraft = {};
@@ -321,6 +493,12 @@
           <button class="btn small ghost" data-action="day" data-n="1" ${isToday ? "disabled" : ""} aria-label="next day">▶</button>
         </span></div>`;
     h += careCard(p);
+    const latestRecap = Object.keys(D().recaps).sort().pop();
+    if (isToday && latestRecap && latestRecap > (p.lastRecapSeen || "") && D().recaps[latestRecap].daysLogged) {
+      h += `<div class="card soft"><h3>🏅 Your ${monthLabel(latestRecap)} recap is ready</h3>
+        <p>See your highlights and how the month went.</p>
+        <button class="btn small" data-action="goto" data-to="insights">See my recap</button></div>`;
+    }
     if (isToday && who5Due(p)) {
       h += `<div class="card soft"><h3>📝 2-minute well-being check-in</h3>
         <p>Five quick questions (the WHO-5) every two weeks. It's how you'll see whether your habits are actually helping over time.</p>
@@ -534,6 +712,21 @@
     const keys = Object.keys(days).filter((k) => days[k].mood != null && daysBetween(k, todayK()) <= 120).sort();
     const need = 28;
     let h = `<h1>Insights</h1><p class="sub">What seems to work for <b>you</b>, not the average person.</p>`;
+    h += thirtyDayStrip(p);
+
+    const recaps = Object.values(D().recaps).sort((a, b) => (a.month < b.month ? 1 : -1));
+    const curMk = monthKey(todayK());
+    const live = buildRecap(p, curMk);
+    h += `<h2>Monthly recaps</h2>`;
+    h += recapCard(p, live, recaps[0], true);
+    h += recaps.slice(0, 3).map((r, i) => recapCard(p, r, recaps[i + 1], false)).join("");
+    if (recaps.length > 3) {
+      h += `<details><summary class="small">Older months (${recaps.length - 3})</summary>${recaps.slice(3).map((r, i) => recapCard(p, r, recaps[i + 4], false)).join("")}</details>`;
+    }
+    h += `<p class="small">Day-by-day details are kept for ${KEEP_DAYS} days. Older days are rolled into their month's recap, which is kept for good.</p>`;
+    if (recaps.length && recaps[0].month > (p.lastRecapSeen || "")) { p.lastRecapSeen = recaps[0].month; save(); }
+
+    h += `<h2>What seems to work for you</h2>`;
     if (keys.length < need) {
       h += `<div class="card"><h3>Gathering your data</h3>
         <p>Rate your day on the Today tab. Personal patterns need about four weeks of ratings before they mean much.</p>
@@ -643,16 +836,26 @@
       ${tagsAvail.map((t) => `<button class="chip ${planFilter === t ? "sel" : ""}" data-action="filter" data-t="${t}">${esc(window.HP_TAG_NAMES[t] || t)}</button>`).join("")}</div>`;
     h += menu.map((a) => planRow(p, a, false)).join("");
 
-    h += `<h2>Family &amp; data</h2><div class="card">
-      <p class="small">Everything is stored only in this browser on this device. Nothing is uploaded. If family members share a device, they can see each other's entries, so teens may prefer their own phone.</p>
+    h += `<h2>Privacy</h2><div class="card">
+      <p class="small">Your entries are only shown in your own profile. Nothing is uploaded; everything stays in this browser on this device. Monthly recaps are private to you too.</p>
+      ${p.pinHash
+        ? `<p>🔒 PIN lock is <b>on</b>. Anyone switching to ${esc(p.name)} on this device needs the PIN.</p>
+           <div class="row"><button class="btn small ghost" data-action="lock-now">Lock now</button>
+           <button class="btn small ghost" data-action="remove-pin">Remove PIN</button></div>`
+        : `<p>Sharing a device? Add a PIN so others can't open your profile.</p>
+           <div class="row"><input id="newPin" type="password" inputmode="numeric" maxlength="8" placeholder="4–8 digits" style="flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--bg)">
+           <button class="btn small" data-action="set-pin">Set PIN</button></div>`}
+      <p class="small">The PIN keeps family members from casually opening your data. It isn't encryption, so for full privacy use your own phone.</p></div>`;
+
+    h += `<h2>Your data</h2><div class="card">
       <div class="row">
         <button class="btn small ghost" data-action="people">Switch / add person</button>
-        <button class="btn small ghost" data-action="export">Export backup</button>
-        <label class="btn small ghost">Import backup<input type="file" accept="application/json" id="importFile" hidden></label>
+        <button class="btn small ghost" data-action="export">Export my backup</button>
+        <label class="btn small ghost">Import a backup<input type="file" accept="application/json" id="importFile" hidden></label>
       </div>
+      <p class="small">Backups include only ${esc(p.name)}'s data.</p>
       <div class="row" style="margin-top:10px">
         <button class="btn small danger" data-action="delete-person">${confirmKey === "person" ? `Tap again to delete ${esc(p.name)}` : `Delete ${esc(p.name)}'s data`}</button>
-        <button class="btn small danger" data-action="delete-all">${confirmKey === "all" ? "Tap again to erase everything" : "Erase everything"}</button>
       </div></div>`;
     h += `<p><a href="#about">📚 The research behind HappyPlace →</a></p>`;
     return h;
@@ -703,7 +906,7 @@
   function peopleSheet() {
     openSheet(`<h2 style="margin-top:0">Who's checking in?</h2>
       <div class="list">${state.profiles.map((p) => `<button class="item ${p.id === state.activeId ? "done" : ""}" data-action="switch" data-id="${p.id}">
-        <span class="emoji">${esc(p.emoji)}</span><span class="body"><span class="label">${esc(p.name)}</span><span class="meta" style="display:block">Age ${p.age}</span></span>
+        <span class="emoji">${esc(p.emoji)}</span><span class="body"><span class="label">${esc(p.name)}${p.pinHash ? " 🔒" : ""}</span></span>
         ${p.id === state.activeId ? `<span class="check"></span>` : ""}</button>`).join("")}</div>
       ${newPersonForm()}
       <button class="btn ghost" data-action="close">Close</button>`);
@@ -747,7 +950,8 @@
     const route = (location.hash || "#today").slice(1);
     document.querySelectorAll(".tabs a").forEach((a) => a.classList.toggle("active", a.dataset.tab === route || (route === "about" && a.dataset.tab === "plan")));
     const y = window.scrollY;
-    $view.innerHTML = P() ? (ROUTES[route] || renderToday)() : renderWelcome();
+    $view.innerHTML = !P() ? renderWelcome() : isLocked(P()) ? renderLocked(P()) : (ROUTES[route] || renderToday)();
+    if (isLocked(P())) { const pin = document.getElementById("pinIn"); if (pin) { pin.focus(); pin.addEventListener("keydown", (e) => { if (e.key === "Enter") document.querySelector("[data-action=unlock]").click(); }); } return; }
     if (keepScroll) window.scrollTo(0, y); else window.scrollTo(0, 0);
     if (route === "move" && P()) wireMoveForm();
     const imp = document.getElementById("importFile");
@@ -786,6 +990,7 @@
     const t = todayK();
     const p = { id: uid(), name, age, band, emoji: band === "child" ? "🦊" : "🙂", chosen: Object.fromEntries(defaults.map((id) => [id, { since: t }])), hidden: {}, targets: {}, cues: {}, created: t, moveGoal: "health" };
     state.profiles.push(p);
+    if (state.activeId) unlocked.delete(state.activeId);
     state.activeId = p.id;
     save(); closeSheet();
     toast(`Added ${name}. Pick your extras in My plan anytime.`);
@@ -793,10 +998,12 @@
   }
 
   function exportData() {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const p = P();
+    const backup = { app: "happyplace", version: 2, exported: todayK(), profile: p, data: D(p.id) };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `happyplace-backup-${todayK()}.json`;
+    a.download = `happyplace-${p.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${todayK()}.json`;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
@@ -806,8 +1013,19 @@
     r.onload = () => {
       try {
         const s = JSON.parse(r.result);
-        if (!s || !Array.isArray(s.profiles) || typeof s.data !== "object") throw new Error("bad");
-        state = s; save(); toast("Backup restored."); render(false);
+        let incoming = [];
+        if (s && s.app === "happyplace" && s.profile && s.profile.id && typeof s.data === "object") incoming = [[s.profile, s.data]];
+        else if (s && Array.isArray(s.profiles) && typeof s.data === "object") incoming = s.profiles.map((pr) => [pr, s.data[pr.id] || {}]);
+        else throw new Error("bad");
+        incoming.forEach(([pr, data]) => {
+          const existing = state.profiles.find((x) => x.id === pr.id);
+          if (existing && existing.pinHash && !unlocked.has(existing.id)) return;
+          state.profiles = state.profiles.filter((x) => x.id !== pr.id).concat([pr]);
+          state.data[pr.id] = data;
+          unlocked.add(pr.id);
+        });
+        state.activeId = incoming[incoming.length - 1][0].id;
+        maintainAll(); toast("Backup restored."); render(false);
       } catch (err) { toast("That file isn't a HappyPlace backup."); }
     };
     r.readAsText(f);
@@ -825,7 +1043,36 @@
       case "goto": location.hash = "#" + el.dataset.to; return;
       case "add-person": return addPerson();
       case "people": return peopleSheet();
-      case "switch": state.activeId = id; save(); closeSheet(); viewDate = todayK(); pendingFit = null; return render(false);
+      case "switch": {
+        if (p && id !== p.id) unlocked.delete(p.id);
+        state.activeId = id; save(); closeSheet(); viewDate = todayK(); pendingFit = null; confirmKey = null;
+        return render(false);
+      }
+      case "unlock": {
+        const pin = document.getElementById("pinIn").value;
+        hashPin(pin, p.pinSalt).then((h) => {
+          if (h === p.pinHash) { unlocked.add(p.id); render(false); }
+          else { toast("That PIN doesn't match."); document.getElementById("pinIn").value = ""; }
+        });
+        return;
+      }
+      case "forgot-pin": {
+        if (confirmKey !== "forgot") { confirmKey = "forgot"; return render(true); }
+        confirmKey = null;
+        delete state.data[p.id];
+        state.profiles = state.profiles.filter((x) => x.id !== p.id);
+        state.activeId = state.profiles[0]?.id || null;
+        save(); toast("Deleted."); return render(false);
+      }
+      case "set-pin": {
+        const pin = document.getElementById("newPin").value.trim();
+        if (!/^\d{4,8}$/.test(pin)) return toast("Use 4–8 digits.");
+        const salt = uid() + uid();
+        hashPin(pin, salt).then((h) => { p.pinSalt = salt; p.pinHash = h; unlocked.add(p.id); save(); toast("PIN set. Your profile is locked when someone else switches in."); render(true); });
+        return;
+      }
+      case "remove-pin": delete p.pinHash; delete p.pinSalt; save(); toast("PIN removed."); return render(true);
+      case "lock-now": unlocked.delete(p.id); return render(false);
       case "day": viewDate = addDays(viewDate, Number(el.dataset.n)); return render(true);
       case "mood": dayW(viewDate).mood = Number(el.dataset.v); save(); return render(true);
       case "toggle": {
@@ -916,10 +1163,6 @@
         state.activeId = state.profiles[0]?.id || null;
         save(); toast("Deleted."); location.hash = "#today"; return render(false);
       }
-      case "delete-all": {
-        if (confirmKey !== "all") { confirmKey = "all"; return render(true); }
-        confirmKey = null; state = blank(); save(); location.hash = "#today"; return render(false);
-      }
     }
   });
 
@@ -944,5 +1187,6 @@
   // Keep bands in sync if data was edited by hand or imported.
   state.profiles.forEach((p) => { p.band = bandOf(p.age || 30); });
   if (state.profiles.length && !P()) state.activeId = state.profiles[0].id;
+  maintainAll();
   render(false);
 })();

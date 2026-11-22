@@ -19,7 +19,12 @@ It's a plain HTML/CSS/JavaScript app with no build step, no accounts and no trac
   - **Kids and teens never see calories or weight goals**, following American Academy of Pediatrics guidance.
 - **Check-ins:** the WHO-5 Well-Being Index every two weeks (ages 10+), with a gentle "talk to someone / 988" message when scores or moods stay low.
 - **Insights:** after about 4 weeks of mood ratings, it compares your mood on days you did each activity vs. days you didn't, labeled "no clear / possible / consistent pattern," with clear warnings that patterns aren't proof. It also suggests a 2-week on/off experiment for a real answer.
-- **Family:** multiple people per device, with backup export/import and delete.
+- **Progress over time:**
+  - A 30-day chart on Insights: bar height shows habits done, color shows mood, plus this week vs. last week.
+  - A **monthly recap** for each person at the end of every month: average mood vs. last month, top habits, weekly targets hit, movement totals, lifting personal bests, WHO-5 change, balanced plates, and "your best days usually included…". The current month shows as "so far."
+  - Day-by-day details are kept for 90 days. Older days are rolled into their month's recap, which is kept for good.
+- **Privacy:** each person's entries, insights and recaps appear only in their own profile, and there's no family-wide view of anyone's data. On a shared device, anyone can set an optional 4–8 digit PIN. The PIN is stored hashed and is required to switch into that profile. It stops casual peeking but isn't encryption. Backups export one person at a time.
+- **Family:** multiple people per device.
 
 ## How honest is the evidence?
 

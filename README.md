@@ -39,6 +39,16 @@ Each habit in the app is labeled **Strong evidence**, **Good evidence, small eff
 
 Positive-psychology activities help modestly. After correcting for small, biased studies, the average effect is small. The app is a habit tool, **not** a treatment for depression or any medical condition.
 
+## Cloud sync (Supabase)
+
+Optional. When it's set up, each person can turn on **My plan → Cloud sync** and sign in with an emailed 6-digit code (no password). Their profile then saves to the cloud automatically, merges changes from multiple devices, and can be restored on a new phone with **Restore from the cloud**. The app talks to Supabase's REST API directly, with no third-party scripts.
+
+Setup:
+1. Create a Supabase project.
+2. In **SQL Editor**, run `supabase/schema.sql`. It creates the table and Row Level Security rules so each account can only read, write or delete its own rows.
+3. In **Authentication → Emails → Templates → Magic Link**, include `{{ .Token }}` in the email so users receive a code. A code works inside the iPhone Home Screen app; a link would open in Safari instead.
+4. Put the Project URL and the **anon** key in `js/config.js`. The anon key is designed to be public. Never commit the `service_role` key.
+
 ## Run it locally
 
 Open `index.html` in a browser, or serve the folder:

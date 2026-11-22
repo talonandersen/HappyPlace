@@ -15,7 +15,8 @@
     try { return JSON.parse(localStorage.getItem(KEY)) || blank(); } catch (e) { return blank(); }
   }
   let state = load();
-  function save() {
+  function save(bump = true) {
+    if (bump) { const p = state.profiles.find((x) => x.id === state.activeId); if (p) { p.localUpdated = new Date().toISOString(); scheduleSync(p.id); } }
     try { localStorage.setItem(KEY, JSON.stringify(state)); }
     catch (e) { toast("Couldn't save on this device (storage may be full or blocked)."); }
   }
@@ -322,7 +323,7 @@
     const keep = state.activeId;
     state.profiles.forEach((p) => { state.activeId = p.id; maintainProfile(p); });
     state.activeId = keep;
-    save();
+    save(false);
   }
 
   function recapCard(p, r, prev, live) {
@@ -837,6 +838,7 @@
       ${tagsAvail.map((t) => `<button class="chip ${planFilter === t ? "sel" : ""}" data-action="filter" data-t="${t}">${esc(window.HP_TAG_NAMES[t] || t)}</button>`).join("")}</div>`;
     h += menu.map((a) => planRow(p, a, false)).join("");
 
+    h += cloudSummaryForPlan(p);
     h += `<h2>Privacy</h2><div class="card">
       <p class="small">Your entries are only shown in your own profile. Nothing is uploaded; everything stays in this browser on this device. Monthly recaps are private to you too.</p>
       ${p.pinHash
@@ -857,7 +859,7 @@
       <p class="small">Backups include only ${esc(p.name)}'s data. ${p.lastBackup ? `Last backup: ${shortDate(p.lastBackup)}.` : "<b>No backup yet.</b>"} Save one monthly to iCloud Drive or Google Drive; to restore on a new phone, use Import.</p>
       <p class="small">Storage on this device: ${storageStatus === "protected" ? "✅ protected (the browser won't clear it on its own)" : storageStatus === "best-effort" ? "⚠️ not guaranteed. Add HappyPlace to your Home Screen and keep backups" : "⚠️ this browser doesn't report it. Keep backups"}. Clearing browsing data or website data still erases it.</p>
       <div class="row" style="margin-top:10px">
-        <button class="btn small danger" data-action="delete-person">${confirmKey === "person" ? `Tap again to delete ${esc(p.name)}` : `Delete ${esc(p.name)}'s data`}</button>
+        <button class="btn small danger" data-action="delete-person">${confirmKey === "person" ? `Tap again to delete ${esc(p.name)}` : `Delete ${esc(p.name)}'s data${auth.links[p.id] ? " (here and in the cloud)" : ""}`}</button>
       </div></div>`;
     h += `<p><a href="#about">📚 The research behind HappyPlace →</a></p>`;
     return h;
@@ -896,7 +898,9 @@
         <p>🧩 Extras each person picks, because what makes one person happy isn't the same for everyone</p>
         <p>📈 Your own patterns, not averages</p>
         <p>🔒 Private: everything stays on this device</p></div>
-      ${newPersonForm()}`;
+      ${newPersonForm()}
+      ${cloudOn() ? `<div class="card"><h3>Already use HappyPlace?</h3><p class="small">Get your progress back on this device.</p>
+        <button class="btn ghost" data-action="cloud-start" data-mode="restore">Restore from the cloud</button></div>` : ""}`;
   }
   function newPersonForm() {
     return `<div class="card"><h3>Add a person</h3>
@@ -911,7 +915,8 @@
         <span class="emoji">${esc(p.emoji)}</span><span class="body"><span class="label">${esc(p.name)}${p.pinHash ? " 🔒" : ""}</span></span>
         ${p.id === state.activeId ? `<span class="check"></span>` : ""}</button>`).join("")}</div>
       ${newPersonForm()}
-      <button class="btn ghost" data-action="close">Close</button>`);
+      <div class="row">${cloudOn() ? `<button class="btn ghost" data-action="cloud-start" data-mode="restore">Restore from the cloud</button>` : ""}
+      <button class="btn ghost" data-action="close">Close</button></div>`);
   }
 
   function who5Sheet() {
@@ -944,6 +949,244 @@
 
   function openSheet(html) { $sheet.innerHTML = `<div class="panel" role="dialog" aria-modal="true">${html}</div>`; $sheet.hidden = false; }
   function closeSheet() { $sheet.hidden = true; $sheet.innerHTML = ""; }
+
+  // ---------- cloud sync (Supabase, via plain REST; no third-party scripts) ----------
+  const CFG = window.HP_CONFIG || {};
+  const cloudOn = () => !!(CFG.supabaseUrl && CFG.supabaseAnonKey);
+  const AUTH_KEY = "happyplace.auth.v1";
+  let auth = (() => { try { return JSON.parse(localStorage.getItem(AUTH_KEY)) || {}; } catch (e) { return {}; } })();
+  auth.sessions ||= {}; auth.links ||= {};
+  const saveAuth = () => { try { localStorage.setItem(AUTH_KEY, JSON.stringify(auth)); } catch (e) { /* ignore */ } };
+  const syncState = {}; // pid -> { busy, error, at }
+  let cloudFlow = null; // { mode: "link"|"restore", pid, email, step: "email"|"code", busy }
+
+  async function api(path, { method = "GET", body, token, headers = {} } = {}) {
+    const res = await fetch(CFG.supabaseUrl.replace(/\/$/, "") + path, {
+      method,
+      headers: { apikey: CFG.supabaseAnonKey, "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const text = await res.text();
+    let json = null; try { json = text ? JSON.parse(text) : null; } catch (e) { /* not json */ }
+    if (!res.ok) {
+      const err = new Error((json && (json.msg || json.message || json.error_description || json.error)) || `HTTP ${res.status}`);
+      err.status = res.status; throw err;
+    }
+    return json;
+  }
+  function setSession(r) {
+    const uidv = r.user && r.user.id;
+    if (!uidv) throw new Error("No user returned");
+    auth.sessions[uidv] = { access: r.access_token, refresh: r.refresh_token, expiresAt: Date.now() + (r.expires_in || 3600) * 1000, email: r.user.email };
+    saveAuth();
+    return uidv;
+  }
+  const refreshing = {};
+  async function tokenFor(userId) {
+    const s = auth.sessions[userId];
+    if (!s) throw new Error("Signed out");
+    if (Date.now() < s.expiresAt - 60000) return s.access;
+    refreshing[userId] ||= api("/auth/v1/token?grant_type=refresh_token", { method: "POST", body: { refresh_token: s.refresh } })
+      .then((r) => { setSession(r); return r.access_token; })
+      .finally(() => { delete refreshing[userId]; });
+    return refreshing[userId];
+  }
+
+  // Combine two copies of one person's data without losing entries from either.
+  function mergeData(local, remote) {
+    const out = JSON.parse(JSON.stringify(local || {}));
+    const r = remote || {};
+    out.days ||= {};
+    Object.entries(r.days || {}).forEach(([k, rd]) => {
+      const ld = out.days[k];
+      if (!ld) { out.days[k] = rd; return; }
+      ["done", "minutes", "plate", "kcal"].forEach((f) => { ld[f] = { ...(rd[f] || {}), ...(ld[f] || {}) }; });
+      if (ld.mood == null && rd.mood != null) ld.mood = rd.mood;
+    });
+    const unionBy = (a = [], b = [], key) => { const seen = new Set(a.map(key)); return a.concat(b.filter((x) => !seen.has(key(x)))); };
+    out.workouts = unionBy(out.workouts, r.workouts, (w) => w.id);
+    out.lifts = unionBy(out.lifts, r.lifts, (l) => l.id);
+    out.who5 = unionBy(out.who5, r.who5, (w) => `${w.date}|${w.raw}`).sort((a, b) => (a.date < b.date ? -1 : 1));
+    out.fit ||= {};
+    Object.entries(r.fit || {}).forEach(([id, arr]) => { out.fit[id] = unionBy(out.fit[id], arr, (x) => `${x.date}|${x.enjoyed}|${x.worth}|${x.hard}|${x.skipped}`); });
+    out.recaps = { ...(r.recaps || {}), ...(out.recaps || {}) };
+    return out;
+  }
+
+  const syncTimers = {};
+  function scheduleSync(pid) {
+    if (!cloudOn() || !auth.links[pid]) return;
+    clearTimeout(syncTimers[pid]);
+    syncTimers[pid] = setTimeout(() => syncProfile(pid), 3000);
+  }
+
+  async function syncProfile(pid, { quiet = true } = {}) {
+    const userId = auth.links[pid];
+    const p = state.profiles.find((x) => x.id === pid);
+    if (!cloudOn() || !userId || !p) return;
+    if (!navigator.onLine) { syncState[pid] = { ...(syncState[pid] || {}), error: "Offline. Changes will sync when you're back online." }; return; }
+    const st = (syncState[pid] ||= {});
+    if (st.busy) { st.again = true; return; }
+    st.busy = true; st.error = null;
+    try {
+      const token = await tokenFor(userId);
+      const rows = await api(`/rest/v1/happyplace_profiles?select=profile,data,updated_at&profile_id=eq.${encodeURIComponent(pid)}`, { token });
+      const remote = rows && rows[0];
+      const lastSync = p.cloudSyncedAt || "";
+      const localChanged = (p.localUpdated || "") > lastSync;
+      if (remote && remote.updated_at > lastSync) {
+        if (!localChanged) {
+          // Cloud is newer and nothing changed here: take the cloud copy.
+          const keep = { id: p.id };
+          Object.keys(p).forEach((k) => delete p[k]);
+          Object.assign(p, remote.profile, keep);
+          state.data[pid] = remote.data;
+        } else {
+          state.data[pid] = mergeData(D(pid), remote.data);
+        }
+        p.band = bandOf(p.age || 30);
+      }
+      const now = new Date().toISOString();
+      const profileOut = { ...p }; delete profileOut.cloudSyncedAt; delete profileOut.localUpdated;
+      await api("/rest/v1/happyplace_profiles?on_conflict=user_id,profile_id", {
+        method: "POST", token,
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: [{ user_id: userId, profile_id: pid, profile: profileOut, data: D(pid), updated_at: now }]
+      });
+      p.cloudSyncedAt = now;
+      if ((p.localUpdated || "") > now) p.localUpdated = now;
+      st.at = now;
+      save(false);
+      if (!quiet) toast("Synced ✓");
+      if (pid === state.activeId && $sheet.hidden && !document.activeElement?.matches?.("input,select,textarea")) render(true);
+    } catch (e) {
+      st.error = e.status === 401 || e.message === "Signed out" ? "Signed out. Link this profile again to keep syncing." : `Couldn't sync: ${e.message}`;
+      if (e.status === 401 || e.message === "Signed out") { delete auth.sessions[userId]; saveAuth(); }
+      if (!quiet) toast(st.error);
+    } finally {
+      st.busy = false;
+      if (st.again) { st.again = false; scheduleSync(pid); }
+    }
+  }
+  function syncAll() { Object.keys(auth.links).forEach((pid) => syncProfile(pid)); }
+
+  function cloudSummaryForPlan(p) {
+    if (!cloudOn()) {
+      return `<h2>Cloud sync</h2><div class="card"><p class="small">Cloud sync isn't turned on for this copy of HappyPlace yet, so data stays on this device only.</p></div>`;
+    }
+    const userId = auth.links[p.id];
+    const s = userId && auth.sessions[userId];
+    const st = syncState[p.id] || {};
+    if (userId && s) {
+      return `<h2>Cloud sync</h2><div class="card">
+        <p>☁️ Synced to <b>${esc(s.email)}</b>${p.cloudSyncedAt ? ` · last synced ${new Date(p.cloudSyncedAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : ""}</p>
+        ${st.error ? `<p class="small" style="color:var(--warn)">${esc(st.error)}</p>` : ""}
+        <p class="small">Your progress saves to your private cloud account automatically. Clearing your browser or getting a new phone won't lose it: just choose "Restore from the cloud" and sign in with this email.</p>
+        <div class="row"><button class="btn small ghost" data-action="sync-now">${st.busy ? "Syncing…" : "Sync now"}</button>
+        <button class="btn small ghost" data-action="cloud-unlink">Stop syncing on this device</button></div></div>`;
+    }
+    return `<h2>Cloud sync</h2><div class="card">
+      ${userId ? `<p class="small" style="color:var(--warn)">You were signed out. Sign in again to keep syncing.</p>` : ""}
+      <p>Back up ${esc(p.name)}'s progress to a private cloud account so nothing is lost if the browser is cleared or the phone is replaced.</p>
+      <p class="small">Only the person who signs in can see this data. ${p.band === "child" ? "For young kids, a parent can sign in with their own email." : p.band === "teen" ? "Teens should use their own email so their data stays theirs." : ""}</p>
+      <button class="btn small" data-action="cloud-start" data-mode="link">Turn on cloud sync</button></div>`;
+  }
+
+  function cloudSheet() {
+    const f = cloudFlow;
+    const title = f.mode === "restore" ? "Restore from the cloud" : `Cloud sync for ${esc((state.profiles.find((x) => x.id === f.pid) || {}).name || "")}`;
+    openSheet(`<h2 style="margin-top:0">${title}</h2>
+      ${f.step === "email" ? `
+        <p class="small">We'll email you a 6-digit code. No password needed.</p>
+        <label class="field">Email<input id="cloudEmail" type="email" autocomplete="email" inputmode="email" value="${esc(f.email || "")}"></label>
+        <div class="row"><button class="btn" data-action="cloud-send" ${f.busy ? "disabled" : ""}>${f.busy ? "Sending…" : "Send code"}</button><button class="btn ghost" data-action="close">Cancel</button></div>`
+      : `
+        <p class="small">Enter the code we sent to <b>${esc(f.email)}</b>. It can take a minute to arrive; check spam too.</p>
+        <label class="field">Code<input id="cloudCode" inputmode="numeric" autocomplete="one-time-code" maxlength="10"></label>
+        <div class="row"><button class="btn" data-action="cloud-verify" ${f.busy ? "disabled" : ""}>${f.busy ? "Checking…" : "Verify"}</button>
+        <button class="btn ghost" data-action="cloud-start" data-mode="${f.mode}">Use a different email</button></div>`}
+      <p class="small">Your data is stored in HappyPlace's private Supabase database, protected so each account can only read its own entries.</p>`);
+    const inp = document.getElementById(f.step === "email" ? "cloudEmail" : "cloudCode");
+    if (inp) { inp.focus(); inp.addEventListener("keydown", (e) => { if (e.key === "Enter") $sheet.querySelector(`[data-action=${f.step === "email" ? "cloud-send" : "cloud-verify"}]`).click(); }); }
+  }
+
+  async function cloudSend() {
+    const email = document.getElementById("cloudEmail").value.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return toast("Please enter a valid email.");
+    cloudFlow.email = email; cloudFlow.busy = true; cloudSheet();
+    try {
+      await api("/auth/v1/otp", { method: "POST", body: { email, create_user: true } });
+      cloudFlow.step = "code";
+    } catch (e) { toast(e.status === 429 ? "Too many codes requested. Wait a few minutes and try again." : `Couldn't send the code: ${e.message}`); }
+    cloudFlow.busy = false; cloudSheet();
+  }
+
+  async function cloudVerify() {
+    const code = document.getElementById("cloudCode").value.trim();
+    if (!/^\d{6,10}$/.test(code)) return toast("Enter the code from the email.");
+    cloudFlow.busy = true; cloudSheet();
+    try {
+      const r = await api("/auth/v1/verify", { method: "POST", body: { type: "email", email: cloudFlow.email, token: code } });
+      const userId = setSession(r);
+      if (cloudFlow.mode === "link") {
+        const p = state.profiles.find((x) => x.id === cloudFlow.pid);
+        auth.links[p.id] = userId; saveAuth();
+        p.cloudSyncedAt = ""; save(false);
+        cloudFlow = null; closeSheet();
+        await syncProfile(p.id, { quiet: false });
+        render(true);
+      } else {
+        const token = await tokenFor(userId);
+        const rows = await api("/rest/v1/happyplace_profiles?select=profile_id,profile,data,updated_at", { token });
+        let added = 0, merged = 0;
+        (rows || []).forEach((row) => {
+          const existing = state.profiles.find((x) => x.id === row.profile_id);
+          if (existing) {
+            if (existing.pinHash && !unlocked.has(existing.id)) return;
+            state.data[existing.id] = mergeData(D(existing.id), row.data);
+            existing.localUpdated = new Date().toISOString();
+            merged++;
+          } else {
+            const prof = { ...row.profile, id: row.profile_id, cloudSyncedAt: row.updated_at };
+            prof.band = bandOf(prof.age || 30);
+            state.profiles.push(prof);
+            state.data[prof.id] = row.data;
+            added++;
+          }
+          auth.links[row.profile_id] = userId;
+        });
+        saveAuth();
+        if (added || merged) {
+          if (!P() || added) state.activeId = (rows[rows.length - 1] || {}).profile_id || state.activeId;
+          maintainAll();
+          cloudFlow = null; closeSheet();
+          toast(`Restored ${added + merged} profile${added + merged === 1 ? "" : "s"} from the cloud.`);
+          syncAll();
+          location.hash = "#today"; render(false);
+        } else {
+          cloudFlow = null; closeSheet();
+          toast("No HappyPlace data found for that email.");
+          render(false);
+        }
+      }
+    } catch (e) {
+      cloudFlow.busy = false; cloudSheet();
+      toast(/expired|invalid/i.test(e.message) ? "That code is wrong or expired. Try again or request a new one." : `Couldn't sign in: ${e.message}`);
+    }
+  }
+
+  async function cloudDeleteRemote(pid) {
+    const userId = auth.links[pid];
+    if (!cloudOn() || !userId || !auth.sessions[userId]) return;
+    try {
+      const token = await tokenFor(userId);
+      await api(`/rest/v1/happyplace_profiles?profile_id=eq.${encodeURIComponent(pid)}`, { method: "DELETE", token });
+    } catch (e) { toast(`Deleted here, but couldn't delete the cloud copy: ${e.message}`); }
+    delete auth.links[pid]; saveAuth();
+  }
+
+  window.addEventListener("online", syncAll);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") syncAll(); });
 
   // ---------- router ----------
   const ROUTES = { today: renderToday, move: renderMove, plate: renderPlate, insights: renderInsights, plan: renderPlan, about: renderAbout };
@@ -1039,6 +1282,7 @@
   }
   function backupCard(p) {
     if (!backupDue(p)) return "";
+    if (auth.links[p.id] && auth.sessions[auth.links[p.id]] && p.cloudSyncedAt && daysBetween(p.cloudSyncedAt.slice(0, 10), todayK()) < 7) return "";
     if (p.backupSnoozed && daysBetween(p.backupSnoozed, todayK()) < 7) return "";
     return `<div class="card soft"><h3>💾 Time to save a backup</h3>
       <p>Your progress lives on this device. A backup takes a few seconds and protects it if you clear your browser, lose your phone or get a new one.${p.lastBackup ? ` Last backup: ${shortDate(p.lastBackup)}.` : ""}</p>
@@ -1077,7 +1321,12 @@
     const act = el.dataset.action, id = el.dataset.id;
     const p = P();
     switch (act) {
-      case "close": closeSheet(); return render(true);
+      case "close": cloudFlow = null; closeSheet(); return render(true);
+      case "cloud-start": cloudFlow = { mode: el.dataset.mode, pid: p && p.id, email: (cloudFlow && cloudFlow.email) || "", step: "email" }; return cloudSheet();
+      case "cloud-send": return cloudSend();
+      case "cloud-verify": return cloudVerify();
+      case "sync-now": syncProfile(p.id, { quiet: false }); return render(true);
+      case "cloud-unlink": delete auth.links[p.id]; saveAuth(); delete p.cloudSyncedAt; save(false); toast("Cloud sync is off on this device. Your cloud copy is kept."); return render(true);
       case "goto": location.hash = "#" + el.dataset.to; return;
       case "add-person": return addPerson();
       case "people": return peopleSheet();
@@ -1197,10 +1446,11 @@
       case "delete-person": {
         if (confirmKey !== "person") { confirmKey = "person"; return render(true); }
         confirmKey = null;
+        cloudDeleteRemote(p.id);
         delete state.data[p.id];
         state.profiles = state.profiles.filter((x) => x.id !== p.id);
         state.activeId = state.profiles[0]?.id || null;
-        save(); toast("Deleted."); location.hash = "#today"; return render(false);
+        save(false); toast("Deleted."); location.hash = "#today"; return render(false);
       }
     }
   });
@@ -1228,5 +1478,6 @@
   if (state.profiles.length && !P()) state.activeId = state.profiles[0].id;
   maintainAll();
   render(false);
+  syncAll();
   protectStorage().then(() => { if ((location.hash || "").startsWith("#plan")) render(true); });
 })();

@@ -24,6 +24,7 @@ It's a plain HTML/CSS/JavaScript app with no build step, no accounts and no trac
   - A **monthly recap** for each person at the end of every month: average mood vs. last month, top habits, weekly targets hit, movement totals, lifting personal bests, WHO-5 change, balanced plates, and "your best days usually included…". The current month shows as "so far."
   - Day-by-day details are kept for 90 days. Older days are rolled into their month's recap, which is kept for good.
 - **Privacy:** each person's entries, insights and recaps appear only in their own profile, and there's no family-wide view of anyone's data. On a shared device, anyone can set an optional 4–8 digit PIN. The PIN is stored hashed and is required to switch into that profile. It stops casual peeking but isn't encryption. Backups export one person at a time.
+- **Keeping data safe:** the app asks the browser to treat its storage as persistent and reminds each person to save a backup (after the first week, then monthly). On phones, backups open the share sheet so they can be saved straight to iCloud Drive or Google Drive, and they restore with Import. A Content Security Policy blocks outside scripts and all network requests, so the app can't send data anywhere.
 - **Family:** multiple people per device.
 
 ## How honest is the evidence?

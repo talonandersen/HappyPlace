@@ -504,6 +504,7 @@
         <p>Five quick questions (the WHO-5) every two weeks. It's how you'll see whether your habits are actually helping over time.</p>
         <button class="btn small" data-action="who5">Start</button></div>`;
     }
+    if (isToday) h += backupCard(p);
     if (isToday) h += rotationCard(p);
     h += moodCard(p, k);
     h += `<h2>${p.band === "child" ? "My happy list" : "Your baseline"}</h2>`;
@@ -853,7 +854,8 @@
         <button class="btn small ghost" data-action="export">Export my backup</button>
         <label class="btn small ghost">Import a backup<input type="file" accept="application/json" id="importFile" hidden></label>
       </div>
-      <p class="small">Backups include only ${esc(p.name)}'s data.</p>
+      <p class="small">Backups include only ${esc(p.name)}'s data. ${p.lastBackup ? `Last backup: ${shortDate(p.lastBackup)}.` : "<b>No backup yet.</b>"} Save one monthly to iCloud Drive or Google Drive; to restore on a new phone, use Import.</p>
+      <p class="small">Storage on this device: ${storageStatus === "protected" ? "✅ protected (the browser won't clear it on its own)" : storageStatus === "best-effort" ? "⚠️ not guaranteed. Add HappyPlace to your Home Screen and keep backups" : "⚠️ this browser doesn't report it. Keep backups"}. Clearing browsing data or website data still erases it.</p>
       <div class="row" style="margin-top:10px">
         <button class="btn small danger" data-action="delete-person">${confirmKey === "person" ? `Tap again to delete ${esc(p.name)}` : `Delete ${esc(p.name)}'s data`}</button>
       </div></div>`;
@@ -997,15 +999,51 @@
     location.hash = "#today"; render(false);
   }
 
-  function exportData() {
+  async function exportData() {
     const p = P();
     const backup = { app: "happyplace", version: 2, exported: todayK(), profile: p, data: D(p.id) };
+    const name = `happyplace-${p.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${todayK()}.json`;
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+    const done = () => { p.lastBackup = todayK(); save(); render(true); };
+    // On phones, the share sheet lets people save straight to Files, iCloud Drive or Google Drive.
+    try {
+      const file = new File([blob], name, { type: "application/json" });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: "HappyPlace backup" });
+        toast("Backup saved. Keep it somewhere safe like iCloud Drive or Google Drive.");
+        return done();
+      }
+    } catch (e) {
+      if (e && e.name === "AbortError") return; // person closed the share sheet
+    }
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `happyplace-${p.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${todayK()}.json`;
+    a.download = name;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    toast("Backup downloaded. Move it somewhere safe like iCloud Drive or Google Drive.");
+    done();
+  }
+
+  // ---------- storage protection ----------
+  let storageStatus = "unknown";
+  async function protectStorage() {
+    try {
+      if (!navigator.storage || !navigator.storage.persist) { storageStatus = "unsupported"; return; }
+      storageStatus = (await navigator.storage.persisted()) || (await navigator.storage.persist()) ? "protected" : "best-effort";
+    } catch (e) { storageStatus = "unsupported"; }
+  }
+  function backupDue(p) {
+    if (p.lastBackup) return daysBetween(p.lastBackup, todayK()) >= 30;
+    return daysBetween(p.created || todayK(), todayK()) >= 7;
+  }
+  function backupCard(p) {
+    if (!backupDue(p)) return "";
+    if (p.backupSnoozed && daysBetween(p.backupSnoozed, todayK()) < 7) return "";
+    return `<div class="card soft"><h3>💾 Time to save a backup</h3>
+      <p>Your progress lives on this device. A backup takes a few seconds and protects it if you clear your browser, lose your phone or get a new one.${p.lastBackup ? ` Last backup: ${shortDate(p.lastBackup)}.` : ""}</p>
+      <div class="row"><button class="btn small" data-action="export">Save backup</button>
+      <button class="btn small ghost" data-action="backup-snooze">Remind me next week</button></div></div>`;
   }
   function importData(e) {
     const f = e.target.files[0]; if (!f) return;
@@ -1073,6 +1111,7 @@
       }
       case "remove-pin": delete p.pinHash; delete p.pinSalt; save(); toast("PIN removed."); return render(true);
       case "lock-now": unlocked.delete(p.id); return render(false);
+      case "backup-snooze": p.backupSnoozed = todayK(); save(); return render(true);
       case "day": viewDate = addDays(viewDate, Number(el.dataset.n)); return render(true);
       case "mood": dayW(viewDate).mood = Number(el.dataset.v); save(); return render(true);
       case "toggle": {
@@ -1189,4 +1228,5 @@
   if (state.profiles.length && !P()) state.activeId = state.profiles[0].id;
   maintainAll();
   render(false);
+  protectStorage().then(() => { if ((location.hash || "").startsWith("#plan")) render(true); });
 })();
